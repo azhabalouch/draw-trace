@@ -10,7 +10,7 @@ import pyautogui
 from PIL import Image, ImageFilter, ImageTk
 from pynput import keyboard as pynput_keyboard
 
-IMAGE_PATH = "images/onlyronaldo.png"
+IMAGE_PATH = "images/fire-right.png"
 HANDLE_SIZE = 16
 MIN_SIZE = 40
 CONFIG_PATH = "canvas_config.json"
@@ -27,11 +27,19 @@ SUPERSAMPLE = 1
 DRAW_START_DELAY = 3
 
 # ---- Movement settings ----------------------------------------------------
-DRAW_SPEED_PX_PER_SEC = 150.0
-TRAVEL_SPEED_PX_PER_SEC = 500.0
+DRAW_SPEED_PX_PER_SEC = 100.0
+TRAVEL_SPEED_PX_PER_SEC = 300.0
 SPEED_VARIANCE = 0.15  # +/- 15% random speed per stroke
 CORNER_PAUSE_SEC = 0.03
 STEP_INTERVAL_SEC = 0.008
+
+# Default overall speed multiplier (1.0 = speeds above, unmodified).
+# Can be overridden at runtime in the UI with the +/- keys, or passed
+# directly into run_trace(..., speed_multiplier=...).
+DEFAULT_SPEED_MULTIPLIER = 0.1
+SPEED_MULTIPLIER_STEP = 0.1
+SPEED_MULTIPLIER_MIN = 0.1
+SPEED_MULTIPLIER_MAX = 5.0
 
 # Human-like imperfection
 JITTER_AMPLITUDE_DRAW = 0.55  # px, tremor while actually drawing
@@ -39,6 +47,9 @@ JITTER_AMPLITUDE_TRAVEL = 0.15  # px, tiny tremor while moving between strokes
 JITTER_SMOOTHING = 0.18  # lower = smoother/slower-varying tremor
 MICRO_PAUSE_PROB = 0.01  # chance per step of a tiny hesitation
 MICRO_PAUSE_RANGE = (0.02, 0.09)
+
+# How often (seconds) to poll while paused, waiting to be resumed/stopped.
+PAUSE_POLL_INTERVAL_SEC = 0.05
 
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.0
@@ -115,13 +126,24 @@ def sort_paths_nearest_neighbour(curves):
     return sorted_curves
 
 
+def _wait_while_paused(pause_event, stop_event):
+    """Blocks here while paused. Returns immediately once resumed or if a
+    stop is requested (caller is responsible for checking stop_event
+    afterwards)."""
+    if pause_event is None:
+        return
+    while pause_event.is_set() and not stop_event.is_set():
+        time.sleep(PAUSE_POLL_INTERVAL_SEC)
+
+
 def smooth_move(start_pt,
-                end_pt,
-                speed,
-                stop_event,
-                jitter=None,
-                jitter_amplitude=0.0,
-                allow_micro_pause=True):
+                 end_pt,
+                 speed,
+                 stop_event,
+                 jitter=None,
+                 jitter_amplitude=0.0,
+                 allow_micro_pause=True,
+                 pause_event=None):
     """Moves the mouse smoothly with easing + optional tremor + occasional
     micro-hesitations, instead of a robotic constant-velocity line."""
     distance = _dist(start_pt, end_pt)
@@ -135,6 +157,11 @@ def smooth_move(start_pt,
     for i in range(1, steps + 1):
         if stop_event.is_set():
             break
+
+        _wait_while_paused(pause_event, stop_event)
+        if stop_event.is_set():
+            break
+
         raw_t = i / steps
         t = ease_in_out(raw_t)
         cur_x = start_pt[0] + (end_pt[0] - start_pt[0]) * t
@@ -159,8 +186,8 @@ def _trace_level(img_gray, threshold, img_orig_w, img_orig_h):
     img_bw = img_gray.point(lambda p: 1 if p < threshold else 0, mode="1")
     bmp = potrace.Bitmap(img_bw)
     path = bmp.trace(turdsize=TURD_SIZE,
-                     alphamax=ALPHAMAX,
-                     opttolerance=OPTTOLERANCE)
+                      alphamax=ALPHAMAX,
+                      opttolerance=OPTTOLERANCE)
 
     def is_outer_frame(curve):
         margin = 2.0
@@ -181,17 +208,34 @@ def _trace_level(img_gray, threshold, img_orig_w, img_orig_h):
     return sort_paths_nearest_neighbour(filtered)
 
 
-def run_trace(image_path, start_x, start_y, width, height, stop_event):
+def run_trace(image_path,
+              start_x,
+              start_y,
+              width,
+              height,
+              stop_event,
+              speed_multiplier=DEFAULT_SPEED_MULTIPLIER,
+              pause_event=None):
+    """speed_multiplier scales both DRAW_SPEED_PX_PER_SEC and
+    TRAVEL_SPEED_PX_PER_SEC. 1.0 = default speed, 2.0 = twice as fast,
+    0.5 = half speed, etc.
+
+    pause_event, if provided, is a threading.Event. While it is set,
+    all mouse movement (travel and drawing) freezes in place until it
+    is cleared again, or stop_event is set."""
     try:
         pyautogui.mouseUp(button="left")
     except Exception:
         pass
 
+    draw_speed = DRAW_SPEED_PX_PER_SEC * speed_multiplier
+    travel_speed = TRAVEL_SPEED_PX_PER_SEC * speed_multiplier
+
     img = Image.open(image_path).convert("L")
 
     if SUPERSAMPLE > 1:
         img = img.resize((img.width * SUPERSAMPLE, img.height * SUPERSAMPLE),
-                         Image.Resampling.LANCZOS)
+                          Image.Resampling.LANCZOS)
 
     # Light denoise only -- heavy median filtering was erasing fine detail.
     img = img.filter(ImageFilter.MedianFilter(size=3))
@@ -227,13 +271,19 @@ def run_trace(image_path, start_x, start_y, width, height, stop_event):
                     aborted = True
                     break
 
+                _wait_while_paused(pause_event, stop_event)
+                if stop_event.is_set():
+                    aborted = True
+                    break
+
                 start_screen_pt = to_screen(curve.start_point)
                 smooth_move(current_mouse_pos,
                             start_screen_pt,
-                            TRAVEL_SPEED_PX_PER_SEC,
+                            travel_speed,
                             stop_event,
                             jitter=travel_jitter,
-                            jitter_amplitude=JITTER_AMPLITUDE_TRAVEL)
+                            jitter_amplitude=JITTER_AMPLITUDE_TRAVEL,
+                            pause_event=pause_event)
                 current_mouse_pos = start_screen_pt
 
                 # Occasional pause before starting a stroke, like a person
@@ -262,7 +312,7 @@ def run_trace(image_path, start_x, start_y, width, height, stop_event):
                             c1 = (segment.c1.x, segment.c1.y)
                             c2 = (segment.c2.x, segment.c2.y)
                             pts = _sample_bezier(current_pos, c1, c2, end_pos,
-                                                 to_screen)
+                                                  to_screen)
 
                         for pt in pts:
                             if stop_event.is_set():
@@ -270,10 +320,11 @@ def run_trace(image_path, start_x, start_y, width, height, stop_event):
                                 break
                             smooth_move(current_mouse_pos,
                                         pt,
-                                        DRAW_SPEED_PX_PER_SEC,
+                                        draw_speed,
                                         stop_event,
                                         jitter=draw_jitter,
-                                        jitter_amplitude=JITTER_AMPLITUDE_DRAW)
+                                        jitter_amplitude=JITTER_AMPLITUDE_DRAW,
+                                        pause_event=pause_event)
                             current_mouse_pos = pt
 
                         if segment.is_corner:
@@ -320,7 +371,9 @@ class OverlayApp:
         self.alpha = 0.6
         self.drawing = False
         self.stop_event = threading.Event()
+        self.pause_event = threading.Event()
         self._hotkey_listener = None
+        self.speed_multiplier = DEFAULT_SPEED_MULTIPLIER
 
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
@@ -355,20 +408,22 @@ class OverlayApp:
         self.canvas.create_image(0, 0, anchor="nw", image=self.tk_image)
 
         self.canvas.create_rectangle(self.win_w - HANDLE_SIZE,
-                                     self.win_h - HANDLE_SIZE,
-                                     self.win_w,
-                                     self.win_h,
-                                     fill="red",
-                                     outline="white",
-                                     tags="handle")
+                                      self.win_h - HANDLE_SIZE,
+                                      self.win_w,
+                                      self.win_h,
+                                      fill="red",
+                                      outline="white",
+                                      tags="handle")
 
-        info = f"{self.win_w}x{self.win_h} @ ({self.win_x},{self.win_y}) | D=draw S=save Esc=quit"
+        info = (f"{self.win_w}x{self.win_h} @ ({self.win_x},{self.win_y}) | "
+                f"speed={self.speed_multiplier:.1f}x (+/- to adjust) | "
+                f"D=draw P=pause S=save Esc=quit")
         self.canvas.create_text(6,
-                                6,
-                                anchor="nw",
-                                text=info,
-                                fill="yellow",
-                                font=("Consolas", 10, "bold"))
+                                 6,
+                                 anchor="nw",
+                                 text=info,
+                                 fill="yellow",
+                                 font=("Consolas", 10, "bold"))
 
     def _on_press(self, event):
         if self.drawing:
@@ -408,6 +463,22 @@ class OverlayApp:
         self.alpha = min(1.0, max(0.15, self.alpha + delta))
         self.root.attributes("-alpha", self.alpha)
 
+    def _change_speed(self, delta):
+        self.speed_multiplier = round(
+            min(SPEED_MULTIPLIER_MAX,
+                max(SPEED_MULTIPLIER_MIN, self.speed_multiplier + delta)), 2)
+        self._redraw()
+
+    def _toggle_pause(self):
+        if not self.drawing:
+            return
+        if self.pause_event.is_set():
+            self.pause_event.clear()
+            print("Resumed drawing.")
+        else:
+            self.pause_event.set()
+            print("Paused drawing.")
+
     def _on_key(self, event):
         key = event.keysym.lower()
         if key in ("escape", "q"):
@@ -417,10 +488,16 @@ class OverlayApp:
             self._save()
         elif key == "d" and not self.drawing:
             self._start_draw()
+        elif key == "p":
+            self._toggle_pause()
         elif event.char == "[":
             self._change_alpha(-0.05)
         elif event.char == "]":
             self._change_alpha(0.05)
+        elif event.char in ("+", "=") or key in ("plus", "kp_add"):
+            self._change_speed(SPEED_MULTIPLIER_STEP)
+        elif event.char == "-" or key in ("minus", "kp_subtract"):
+            self._change_speed(-SPEED_MULTIPLIER_STEP)
 
     def _save(self):
         config = {
@@ -428,6 +505,7 @@ class OverlayApp:
             "CANVAS_START_Y": self.win_y,
             "CANVAS_WIDTH": self.win_w,
             "CANVAS_HEIGHT": self.win_h,
+            "SPEED_MULTIPLIER": self.speed_multiplier,
         }
         with open(CONFIG_PATH, "w") as f:
             json.dump(config, f, indent=2)
@@ -435,13 +513,21 @@ class OverlayApp:
     def _start_draw(self):
         self.drawing = True
         self.stop_event.clear()
+        self.pause_event.clear()
         start_x, start_y = self.win_x, self.win_y
         width, height = self.win_w, self.win_h
+        speed_multiplier = self.speed_multiplier
 
         def on_press(key):
             if key == pynput_keyboard.Key.esc:
                 self.stop_event.set()
                 return False
+            try:
+                char = key.char
+            except AttributeError:
+                char = None
+            if char and char.lower() == "p":
+                self._toggle_pause()
 
         self._hotkey_listener = pynput_keyboard.Listener(on_press=on_press)
         self._hotkey_listener.start()
@@ -451,8 +537,14 @@ class OverlayApp:
         def worker():
             time.sleep(DRAW_START_DELAY)
             try:
-                run_trace(self.image_path, start_x, start_y, width, height,
-                          self.stop_event)
+                run_trace(self.image_path,
+                          start_x,
+                          start_y,
+                          width,
+                          height,
+                          self.stop_event,
+                          speed_multiplier=speed_multiplier,
+                          pause_event=self.pause_event)
             except Exception as exc:
                 print("Trace failed:", exc)
             finally:
@@ -462,6 +554,7 @@ class OverlayApp:
 
     def _finish_draw(self):
         self.drawing = False
+        self.pause_event.clear()
         if self._hotkey_listener is not None:
             self._hotkey_listener.stop()
             self._hotkey_listener = None
