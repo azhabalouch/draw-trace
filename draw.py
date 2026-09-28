@@ -10,7 +10,7 @@ import pyautogui
 from PIL import Image, ImageFilter, ImageTk
 from pynput import keyboard as pynput_keyboard
 
-IMAGE_PATH = "images/fire-right.png"
+IMAGE_PATH = "images/BnW/whole.jpg"
 HANDLE_SIZE = 16
 MIN_SIZE = 40
 CONFIG_PATH = "canvas_config.json"
@@ -20,9 +20,9 @@ CONFIG_PATH = "canvas_config.json"
 # brightness bands (light -> dark) and draw each pass on top of the last.
 # This is what lets shading/mid-tones show up instead of just a silhouette.
 THRESHOLD_LEVELS = [205, 165, 125, 85]  # light band first, dark band last
-TURD_SIZE = 2  # lower = keep smaller details (was 8)
-ALPHAMAX = 0.6  # lower = sharper corners, hugs bitmap more closely
-OPTTOLERANCE = 0.15  # lower = tighter curve fit to the traced bitmap
+TURD_SIZE = 8  # lower = keep smaller details (was 8)
+ALPHAMAX = 1  # lower = sharper corners, hugs bitmap more closely
+OPTTOLERANCE = 0.1  # lower = tighter curve fit to the traced bitmap
 SUPERSAMPLE = 1
 DRAW_START_DELAY = 3
 
@@ -36,15 +36,15 @@ STEP_INTERVAL_SEC = 0.008
 # Default overall speed multiplier (1.0 = speeds above, unmodified).
 # Can be overridden at runtime in the UI with the +/- keys, or passed
 # directly into run_trace(..., speed_multiplier=...).
-DEFAULT_SPEED_MULTIPLIER = 0.1
+DEFAULT_SPEED_MULTIPLIER = 0.5
 SPEED_MULTIPLIER_STEP = 0.1
 SPEED_MULTIPLIER_MIN = 0.1
 SPEED_MULTIPLIER_MAX = 5.0
 
 # Human-like imperfection
-JITTER_AMPLITUDE_DRAW = 0.55  # px, tremor while actually drawing
-JITTER_AMPLITUDE_TRAVEL = 0.15  # px, tiny tremor while moving between strokes
-JITTER_SMOOTHING = 0.18  # lower = smoother/slower-varying tremor
+JITTER_AMPLITUDE_DRAW = 0.2  # px, tremor while actually drawing
+JITTER_AMPLITUDE_TRAVEL = 0.07  # px, tiny tremor while moving between strokes
+JITTER_SMOOTHING = 0.1  # lower = smoother/slower-varying tremor
 MICRO_PAUSE_PROB = 0.01  # chance per step of a tiny hesitation
 MICRO_PAUSE_RANGE = (0.02, 0.09)
 
@@ -127,13 +127,15 @@ def sort_paths_nearest_neighbour(curves):
 
 
 def _wait_while_paused(pause_event, stop_event):
-    """Blocks here while paused. Returns immediately once resumed or if a
-    stop is requested (caller is responsible for checking stop_event
-    afterwards)."""
+    """Blocks here while paused. Returns True if it actually waited
+    (was paused), False if it passed straight through."""
     if pause_event is None:
-        return
+        return False
+    paused = False
     while pause_event.is_set() and not stop_event.is_set():
+        paused = True
         time.sleep(PAUSE_POLL_INTERVAL_SEC)
+    return paused
 
 
 def smooth_move(start_pt,
@@ -144,40 +146,73 @@ def smooth_move(start_pt,
                  jitter_amplitude=0.0,
                  allow_micro_pause=True,
                  pause_event=None):
-    """Moves the mouse smoothly with easing + optional tremor + occasional
-    micro-hesitations, instead of a robotic constant-velocity line."""
-    distance = _dist(start_pt, end_pt)
-    if distance < 1e-3:
-        return
+    """Returns the (x, y) the mouse actually ends at.
 
-    speed = speed * random.uniform(1 - SPEED_VARIANCE, 1 + SPEED_VARIANCE)
-    duration = distance / speed
-    steps = max(1, int(duration / STEP_INTERVAL_SEC))
+    Normally that's just end_pt. But if the pen gets paused mid-move and
+    the user manually repositions the mouse (e.g. dragging with the
+    button still held down), the *target* itself is shifted by that same
+    delta -- so the move continues on from the new position instead of
+    pulling back onto the original absolute point. The caller uses the
+    returned position to know how far things have shifted so it can keep
+    the rest of the trace (all future points) aligned to it."""
+    base_speed = speed
+    cur_pos = start_pt
+    target = end_pt
 
-    for i in range(1, steps + 1):
-        if stop_event.is_set():
-            break
+    while True:
+        distance = _dist(cur_pos, target)
+        if distance < 1e-3:
+            return target
 
-        _wait_while_paused(pause_event, stop_event)
-        if stop_event.is_set():
-            break
+        speed = base_speed * random.uniform(1 - SPEED_VARIANCE, 1 + SPEED_VARIANCE)
+        duration = distance / speed
+        steps = max(1, int(duration / STEP_INTERVAL_SEC))
+        leg_start = cur_pos
+        interrupted = False
 
-        raw_t = i / steps
-        t = ease_in_out(raw_t)
-        cur_x = start_pt[0] + (end_pt[0] - start_pt[0]) * t
-        cur_y = start_pt[1] + (end_pt[1] - start_pt[1]) * t
+        for i in range(1, steps + 1):
+            if stop_event.is_set():
+                return cur_pos
 
-        if jitter is not None and jitter_amplitude > 0:
-            jx, jy = jitter.step(jitter_amplitude)
-            cur_x += jx
-            cur_y += jy
+            was_paused = _wait_while_paused(pause_event, stop_event)
+            if stop_event.is_set():
+                return cur_pos
+            if was_paused:
+                # Mouse may have been moved manually while paused (e.g. the
+                # button was still held down and the user dragged it).
+                # Shift the target by the same delta instead of snapping
+                # or walking back to the original point -- the rest of
+                # this move (and everything after it) now continues from
+                # here.
+                actual = pyautogui.position()
+                dx = actual[0] - cur_pos[0]
+                dy = actual[1] - cur_pos[1]
+                target = (target[0] + dx, target[1] + dy)
+                cur_pos = actual
+                interrupted = True
+                break
 
-        pyautogui.moveTo(int(cur_x), int(cur_y))
+            raw_t = i / steps
+            t = ease_in_out(raw_t)
+            cur_x = leg_start[0] + (target[0] - leg_start[0]) * t
+            cur_y = leg_start[1] + (target[1] - leg_start[1]) * t
 
-        if allow_micro_pause and random.random() < MICRO_PAUSE_PROB:
-            time.sleep(random.uniform(*MICRO_PAUSE_RANGE))
+            if jitter is not None and jitter_amplitude > 0:
+                jx, jy = jitter.step(jitter_amplitude)
+                cur_x += jx
+                cur_y += jy
 
-        time.sleep(STEP_INTERVAL_SEC)
+            pyautogui.moveTo(int(cur_x), int(cur_y))
+            cur_pos = (cur_x, cur_y)
+
+            if allow_micro_pause and random.random() < MICRO_PAUSE_PROB:
+                time.sleep(random.uniform(*MICRO_PAUSE_RANGE))
+
+            time.sleep(STEP_INTERVAL_SEC)
+
+        if not interrupted:
+            return target
+        # else: loop back and recompute a fresh leg from cur_pos -> target
 
 
 def _trace_level(img_gray, threshold, img_orig_w, img_orig_h):
@@ -244,10 +279,20 @@ def run_trace(image_path,
     scale_x = width / img_orig_w
     scale_y = height / img_orig_h
 
+    # Accumulates whenever the user manually repositions the mouse during
+    # a pause. Every future to_screen() call includes it, so once you drag
+    # the pen somewhere else, the rest of the trace (all remaining curves)
+    # continues rigidly shifted to line up with your new position instead
+    # of snapping/walking back to the original absolute spot.
+    offset_x = 0.0
+    offset_y = 0.0
+
     def to_screen(pt):
         if hasattr(pt, 'x'):
-            return (start_x + pt.x * scale_x, start_y + pt.y * scale_y)
-        return (start_x + pt[0] * scale_x, start_y + pt[1] * scale_y)
+            return (start_x + pt.x * scale_x + offset_x,
+                     start_y + pt.y * scale_y + offset_y)
+        return (start_x + pt[0] * scale_x + offset_x,
+                start_y + pt[1] * scale_y + offset_y)
 
     levels = [
         _trace_level(img, thresh, img_orig_w, img_orig_h)
@@ -271,20 +316,27 @@ def run_trace(image_path,
                     aborted = True
                     break
 
-                _wait_while_paused(pause_event, stop_event)
+                was_paused = _wait_while_paused(pause_event, stop_event)
                 if stop_event.is_set():
                     aborted = True
                     break
+                if was_paused:
+                    actual = pyautogui.position()
+                    offset_x += actual[0] - current_mouse_pos[0]
+                    offset_y += actual[1] - current_mouse_pos[1]
+                    current_mouse_pos = actual
 
                 start_screen_pt = to_screen(curve.start_point)
-                smooth_move(current_mouse_pos,
-                            start_screen_pt,
-                            travel_speed,
-                            stop_event,
-                            jitter=travel_jitter,
-                            jitter_amplitude=JITTER_AMPLITUDE_TRAVEL,
-                            pause_event=pause_event)
-                current_mouse_pos = start_screen_pt
+                final_pos = smooth_move(current_mouse_pos,
+                                         start_screen_pt,
+                                         travel_speed,
+                                         stop_event,
+                                         jitter=travel_jitter,
+                                         jitter_amplitude=JITTER_AMPLITUDE_TRAVEL,
+                                         pause_event=pause_event)
+                offset_x += final_pos[0] - start_screen_pt[0]
+                offset_y += final_pos[1] - start_screen_pt[1]
+                current_mouse_pos = final_pos
 
                 # Occasional pause before starting a stroke, like a person
                 # deciding where the next line goes.
@@ -318,14 +370,16 @@ def run_trace(image_path,
                             if stop_event.is_set():
                                 aborted = True
                                 break
-                            smooth_move(current_mouse_pos,
-                                        pt,
-                                        draw_speed,
-                                        stop_event,
-                                        jitter=draw_jitter,
-                                        jitter_amplitude=JITTER_AMPLITUDE_DRAW,
-                                        pause_event=pause_event)
-                            current_mouse_pos = pt
+                            final_pos = smooth_move(current_mouse_pos,
+                                                     pt,
+                                                     draw_speed,
+                                                     stop_event,
+                                                     jitter=draw_jitter,
+                                                     jitter_amplitude=JITTER_AMPLITUDE_DRAW,
+                                                     pause_event=pause_event)
+                            offset_x += final_pos[0] - pt[0]
+                            offset_y += final_pos[1] - pt[1]
+                            current_mouse_pos = final_pos
 
                         if segment.is_corner:
                             time.sleep(CORNER_PAUSE_SEC)
